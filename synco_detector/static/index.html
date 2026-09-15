@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Synco Detector</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div>
+        <h1>Synco Detector</h1>
+        <p class="tag">Live lyrics · beat emphasis · 1-pulse vs 2/4 syncopation</p>
+      </div>
+      <div class="status" id="status">
+        <span class="dot" id="dot"></span>
+        <span id="micLabel">starting…</span>
+      </div>
+    </header>
+
+    <section class="lyrics-panel">
+      <div class="kicker">Live lyrics</div>
+      <p class="lyrics" id="lyrics">Listening for words…</p>
+      <p class="partial" id="partial"></p>
+    </section>
+
+    <section class="verdict-panel">
+      <div class="spectrum-labels">
+        <span>Simple · 1-emphasis<br /><small>hymn / kids-church pulse</small></span>
+        <span class="right">Syncopated · 2/4<br /><small>backbeat / off-beat groove</small></span>
+      </div>
+      <div class="spectrum" id="spectrum">
+        <div class="track">
+          <div class="needle" id="needle"></div>
+        </div>
+      </div>
+      <div class="verdict-row">
+        <div>
+          <div class="kicker">Judgment</div>
+          <h2 id="judgment">Waiting for a pulse…</h2>
+        </div>
+        <div class="stats">
+          <div><span class="kicker">Side</span><strong id="side">—</strong></div>
+          <div><span class="kicker">Spectrum</span><strong id="specVal">—</strong></div>
+          <div><span class="kicker">Confidence</span><strong id="conf">—</strong></div>
+          <div><span class="kicker">Emphasis</span><strong id="emph">—</strong></div>
+          <div><span class="kicker">Meter</span><strong id="meter">—</strong></div>
+          <div><span class="kicker">Tempo</span><strong id="tempo">—</strong></div>
+        </div>
+      </div>
+      <p class="summary" id="summary"></p>
+    </section>
+
+    <section class="grid-panel">
+      <div>
+        <div class="kicker">Beat energy (1 · 2 · 3 · 4)</div>
+        <div class="beats" id="beats">
+          <button type="button">1</button>
+          <button type="button">2</button>
+          <button type="button">3</button>
+          <button type="button">4</button>
+        </div>
+      </div>
+      <div>
+        <div class="kicker">16th-note accent map</div>
+        <div class="sixteenths" id="sixteenths"></div>
+      </div>
+      <div>
+        <div class="kicker">Input level</div>
+        <div class="level"><div id="levelBar"></div></div>
+      </div>
+    </section>
+
+    <section class="tools">
+      <label class="file">
+        Analyze a file
+        <input type="file" id="file" accept="audio/*" />
+      </label>
+      <button type="button" id="selftest">Run self-test</button>
+      <pre class="report" id="report" hidden></pre>
+    </section>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

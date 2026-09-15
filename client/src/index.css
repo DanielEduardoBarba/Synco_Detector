@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 20% -10%, rgba(30, 215, 96, 0.12), transparent 55%),
+    radial-gradient(900px 500px at 90% 0%, rgba(80, 90, 180, 0.10), transparent 50%),
+    #0b0b0b;
+}
+
+.freq-bar {
+  transform-origin: bottom center;
+  will-change: height, opacity;
+}
