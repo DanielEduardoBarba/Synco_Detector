@@ -10,13 +10,37 @@ import json
 import sys
 
 
+def _as_text(val) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace").strip()
+    if isinstance(val, (list, tuple)):
+        parts = [_as_text(x) for x in val]
+        return ", ".join(p for p in parts if p)
+    # dbus Array / String etc. stringify poorly — prefer str after unwrap
+    try:
+        if hasattr(val, "strip"):
+            return str(val).strip()
+    except Exception:
+        pass
+    text = str(val).strip()
+    return text
+
+
 def _track_field(track: dict, *keys: str):
+    # BlueZ may use dbus.String keys; normalize to plain str.
+    normalized = {}
+    for key, val in dict(track or {}).items():
+        normalized[str(key)] = val
     for key in keys:
-        if key in track and track[key] is not None and track[key] != "":
-            val = track[key]
-            if isinstance(val, bytes):
-                val = val.decode("utf-8", errors="replace")
-            return val
+        if key in normalized and normalized[key] is not None and normalized[key] != "":
+            return normalized[key]
+    # Case-insensitive fallback
+    lower_map = {str(k).lower(): v for k, v in normalized.items()}
+    for key in keys:
+        if key.lower() in lower_map and lower_map[key.lower()] not in (None, ""):
+            return lower_map[key.lower()]
     return None
 
 
@@ -34,8 +58,8 @@ def _as_ms(val) -> int | None:
     return max(0, n)
 
 
-def _collect() -> dict:
-    out: dict = {
+def _empty() -> dict:
+    return {
         "available": False,
         "title": "",
         "artist": "",
@@ -43,6 +67,7 @@ def _collect() -> dict:
         "genre": "",
         "status": "",
         "device": "",
+        "player_name": "",
         "player_path": "",
         "position_ms": 0,
         "duration_ms": 0,
@@ -50,6 +75,10 @@ def _collect() -> dict:
         "transport_uuid": "",
         "transport_volume": None,
     }
+
+
+def _collect() -> dict:
+    out = _empty()
     import dbus
 
     bus = dbus.SystemBus()
@@ -59,7 +88,13 @@ def _collect() -> dict:
     )
     objects = om.GetManagedObjects()
 
-    for path, ifaces in objects.items():
+    preferred_player = ""
+    for _path, ifaces in objects.items():
+        if "org.bluez.MediaControl1" in ifaces:
+            ctrl = ifaces["org.bluez.MediaControl1"]
+            player = ctrl.get("Player")
+            if player:
+                preferred_player = str(player)
         if "org.bluez.MediaTransport1" in ifaces:
             tr = ifaces["org.bluez.MediaTransport1"]
             out["transport_state"] = str(tr.get("State", "") or "")
@@ -74,25 +109,55 @@ def _collect() -> dict:
         if "org.bluez.MediaPlayer1" not in ifaces:
             continue
         player = ifaces["org.bluez.MediaPlayer1"]
+        props = None
+        try:
+            props = dbus.Interface(
+                bus.get_object("org.bluez", path),
+                "org.freedesktop.DBus.Properties",
+            )
+        except Exception:
+            props = None
+        # Prefer live Properties.Get for Track — cached snapshot can lag.
         track = player.get("Track") or {}
+        if props is not None:
+            try:
+                live = props.Get("org.bluez.MediaPlayer1", "Track")
+                if live:
+                    track = live
+            except Exception:
+                pass
         if hasattr(track, "items"):
             track = dict(track)
-        title = str(_track_field(track, "Title") or "").strip()
-        artist = str(_track_field(track, "Artist", "AlbumArtist") or "").strip()
-        album = str(_track_field(track, "Album") or "").strip()
-        genre = str(_track_field(track, "Genre") or "").strip()
-        status = str(player.get("Status", "") or "")
-        device = str(player.get("Device", "") or "")
-        name = str(player.get("Name", "") or "")
+
+        title = _as_text(_track_field(track, "Title", "Name"))
+        artist = _as_text(_track_field(track, "Artist", "AlbumArtist", "Composer"))
+        album = _as_text(_track_field(track, "Album"))
+        genre = _as_text(_track_field(track, "Genre"))
+        status = _as_text(player.get("Status", ""))
+        device = _as_text(player.get("Device", ""))
+        player_name = _as_text(player.get("Name", ""))
         position_ms = _as_ms(player.get("Position")) or 0
+        if props is not None:
+            try:
+                live_pos = props.Get("org.bluez.MediaPlayer1", "Position")
+                position_ms = _as_ms(live_pos) or position_ms
+            except Exception:
+                pass
         duration_ms = _as_ms(_track_field(track, "Duration")) or 0
+
         score = 0
+        if str(path) == preferred_player:
+            score += 8
         if title:
             score += 4
         if artist:
             score += 2
-        if status.lower() in {"playing", "paused"}:
+        if album:
             score += 1
+        if status.lower() in {"playing", "paused"}:
+            score += 3
+        if status.lower() == "playing":
+            score += 2
         row = {
             **out,
             "available": bool(title or artist or album),
@@ -101,7 +166,8 @@ def _collect() -> dict:
             "album": album,
             "genre": genre,
             "status": status,
-            "device": device or name,
+            "device": device or player_name,
+            "player_name": player_name,
             "player_path": str(path),
             "position_ms": position_ms,
             "duration_ms": duration_ms,
@@ -133,6 +199,7 @@ def cmd_seek(position_ms: int) -> dict:
     player = _player_iface(path)
     cur = int(meta.get("position_ms") or 0)
     target = max(0, int(position_ms))
+    method = None
     # Prefer absolute Position write when supported; else relative Seek.
     try:
         props = dbus.Interface(
@@ -140,25 +207,38 @@ def cmd_seek(position_ms: int) -> dict:
             "org.freedesktop.DBus.Properties",
         )
         props.Set("org.bluez.MediaPlayer1", "Position", dbus.UInt32(target))
-        return {"ok": True, "method": "SetPosition", "position_ms": target}
+        method = "SetPosition"
     except Exception:
-        pass
-    try:
-        delta = target - cur
-        player.Seek(dbus.Int64(delta))
-        return {"ok": True, "method": "Seek", "delta_ms": delta}
-    except Exception as exc:
-        # Best-effort FF/RW pulses for players without Seek.
+        props = None
+    if method is None:
         try:
-            steps = max(1, min(40, abs(target - cur) // 2000))
-            meth = player.FastForward if target > cur else player.Rewind
-            for _ in range(steps):
-                meth()
-                time.sleep(0.05)
-            player.Play()
-            return {"ok": True, "method": "FastForward/Rewind", "steps": steps}
-        except Exception as exc2:
-            return {"ok": False, "error": f"{exc}; {exc2}"}
+            delta = target - cur
+            player.Seek(dbus.Int64(delta))
+            method = "Seek"
+        except Exception as exc:
+            # Best-effort FF/RW pulses for players without Seek.
+            try:
+                steps = max(1, min(40, abs(target - cur) // 2000))
+                meth = player.FastForward if target > cur else player.Rewind
+                for _ in range(steps):
+                    meth()
+                    time.sleep(0.05)
+                player.Play()
+                method = "FastForward/Rewind"
+            except Exception as exc2:
+                return {"ok": False, "error": f"{exc}; {exc2}"}
+    # Give AVRCP a beat, then read back Position (iPhone often lags a little).
+    time.sleep(0.12)
+    confirmed = target
+    try:
+        props = dbus.Interface(
+            dbus.SystemBus().get_object("org.bluez", path),
+            "org.freedesktop.DBus.Properties",
+        )
+        confirmed = _as_ms(props.Get("org.bluez.MediaPlayer1", "Position")) or target
+    except Exception:
+        confirmed = target
+    return {"ok": True, "method": method, "position_ms": int(confirmed), "requested_ms": target}
 
 
 def cmd_transport(action: str) -> dict:

@@ -66,12 +66,44 @@ function hashHue(text) {
 }
 
 function coverStyle(title, artist) {
+  if (!title && !artist) {
+    return {
+      background: 'linear-gradient(160deg, #2a2a2a 0%, #141414 55%, #0a0a0a 100%)'
+    }
+  }
   const seed = `${artist}|${title}` || 'synco'
   const h = hashHue(seed)
   const h2 = (h + 48) % 360
   return {
     background: `linear-gradient(145deg, hsl(${h} 55% 42%) 0%, hsl(${h2} 40% 18%) 55%, #0d0d0d 100%)`
   }
+}
+
+function useCoverArt(title, artist, album) {
+  const [url, setUrl] = useState(null)
+  useEffect(() => {
+    const t = (title || '').trim()
+    const a = (artist || '').trim()
+    const al = (album || '').trim()
+    if (!t && !a) {
+      setUrl(null)
+      return undefined
+    }
+    let cancelled = false
+    const q = new URLSearchParams({ title: t, artist: a, album: al })
+    fetch(`/api/cover?${q}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!cancelled) setUrl(data?.url || null)
+      })
+      .catch(() => {
+        if (!cancelled) setUrl(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [title, artist, album])
+  return url
 }
 
 function useSmoothedBars(raw, count = BAR_COUNT) {
@@ -144,7 +176,7 @@ function SpeakerIcon({ muted, className = 'h-5 w-5' }) {
   )
 }
 
-function useListenThrough(enabled, ctxRef) {
+function useListenThrough(enabled, ctxRef, flushRef) {
   useEffect(() => {
     if (!enabled) return undefined
     let ws
@@ -152,6 +184,39 @@ function useListenThrough(enabled, ctxRef) {
     let nextTime = 0
     let sr = 22050
     let gainNode = null
+    // Serialize handlers so overlapping async resumes can't double-schedule.
+    let chain = Promise.resolve()
+    const activeSources = new Set()
+    // Short lead keeps hear-through near live A2DP (not a multi-second buffer).
+    const TARGET_LEAD = 0.06
+    const MAX_LEAD = 0.18
+
+    const stopAll = () => {
+      for (const src of activeSources) {
+        try {
+          src.stop(0)
+        } catch (err) {
+          /* already ended */
+        }
+        try {
+          src.disconnect()
+        } catch (err) {
+          /* ignore */
+        }
+      }
+      activeSources.clear()
+    }
+
+    const flush = () => {
+      stopAll()
+      const ctx = ctxRef?.current
+      if (ctx && ctx.state !== 'closed') {
+        nextTime = ctx.currentTime + TARGET_LEAD
+      } else {
+        nextTime = 0
+      }
+    }
+    if (flushRef) flushRef.current = flush
 
     const ensureCtx = async () => {
       let ctx = ctxRef?.current
@@ -169,50 +234,73 @@ function useListenThrough(enabled, ctxRef) {
       }
       if (!gainNode || gainNode.context !== ctx) {
         gainNode = ctx.createGain()
-        gainNode.gain.value = 1.85
+        gainNode.gain.value = 1.6
         gainNode.connect(ctx.destination)
       }
       return ctx
+    }
+
+    const handleMessage = async (ev) => {
+      if (closed) return
+      if (typeof ev.data === 'string') {
+        try {
+          const hdr = JSON.parse(ev.data)
+          if (hdr.sr) sr = Number(hdr.sr) || sr
+        } catch (err) {
+          console.warn(err)
+        }
+        const ctx = await ensureCtx()
+        stopAll()
+        nextTime = ctx.currentTime + TARGET_LEAD
+        return
+      }
+      const ctx = await ensureCtx()
+      if (!gainNode || closed) return
+      const f32 = new Float32Array(ev.data)
+      if (!f32.length) return
+      let peak = 0
+      for (let i = 0; i < f32.length; i += 1) {
+        const a = Math.abs(f32[i])
+        if (a > peak) peak = a
+      }
+      // Skip pure digital silence (A2DP idle). Don't touch nextTime — on the
+      // next real chunk we underrun-recover cleanly instead of stacking silence.
+      if (peak < 1e-5) return
+
+      const now = ctx.currentTime
+      // Drop backlog instead of jumping start time into currently playing audio
+      // (that jump was the "smooth then double" catch-up).
+      if (nextTime > now + MAX_LEAD) return
+
+      const buf = ctx.createBuffer(1, f32.length, sr)
+      buf.copyToChannel(f32, 0)
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      src.connect(gainNode)
+      src.onended = () => {
+        activeSources.delete(src)
+        try {
+          src.disconnect()
+        } catch (err) {
+          /* ignore */
+        }
+      }
+
+      if (nextTime < now + 0.015) {
+        // Underrun: leave a small lead so the next chunks abut cleanly.
+        nextTime = now + TARGET_LEAD
+      }
+      activeSources.add(src)
+      src.start(nextTime)
+      nextTime += buf.duration
     }
 
     const connect = () => {
       if (closed) return
       ws = new WebSocket(wsUrl('/ws/audio'))
       ws.binaryType = 'arraybuffer'
-      ws.onmessage = async (ev) => {
-        if (typeof ev.data === 'string') {
-          try {
-            const hdr = JSON.parse(ev.data)
-            if (hdr.sr) sr = Number(hdr.sr) || sr
-          } catch (err) {
-            console.warn(err)
-          }
-          const ctx = await ensureCtx()
-          nextTime = ctx.currentTime + 0.06
-          return
-        }
-        const ctx = await ensureCtx()
-        if (!gainNode) return
-        const f32 = new Float32Array(ev.data)
-        if (!f32.length) return
-        let peak = 0
-        for (let i = 0; i < f32.length; i += 1) {
-          const a = Math.abs(f32[i])
-          if (a > peak) peak = a
-        }
-        // Skip pure digital silence (A2DP idle) so we don't schedule dead air.
-        if (peak < 1e-5) return
-        // Always tag the buffer with the stream sample rate; the context resamples.
-        const buf = ctx.createBuffer(1, f32.length, sr)
-        buf.copyToChannel(f32, 0)
-        const src = ctx.createBufferSource()
-        src.buffer = buf
-        src.connect(gainNode)
-        const now = ctx.currentTime
-        if (nextTime < now + 0.04) nextTime = now + 0.04
-        if (nextTime > now + 0.4) nextTime = now + 0.06
-        src.start(nextTime)
-        nextTime += buf.duration
+      ws.onmessage = (ev) => {
+        chain = chain.then(() => handleMessage(ev)).catch((err) => console.warn(err))
       }
       ws.onclose = () => {
         if (!closed) setTimeout(connect, 900)
@@ -229,6 +317,8 @@ function useListenThrough(enabled, ctxRef) {
     connect()
     return () => {
       closed = true
+      if (flushRef && flushRef.current === flush) flushRef.current = null
+      stopAll()
       try {
         ws?.close()
       } catch (err) {
@@ -242,7 +332,7 @@ function useListenThrough(enabled, ctxRef) {
         /* ignore */
       }
     }
-  }, [enabled, ctxRef])
+  }, [enabled, ctxRef, flushRef])
 }
 
 function MiniGroove({ avg }) {
@@ -420,19 +510,39 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
   const [draft, setDraft] = useState(0)
   const [tick, setTick] = useState(0)
   const base = useRef({ pos: 0, at: Date.now(), playing: false })
+  const seekHold = useRef(null) // { target, until }
   const barRef = useRef(null)
+  const playing = String(status || '').toLowerCase() === 'playing'
 
   useEffect(() => {
     if (dragging) return
-    base.current = {
-      pos: Math.max(0, Number(positionMs) || 0),
-      at: Date.now(),
-      playing: String(status || '').toLowerCase() === 'playing'
+    const remote = Math.max(0, Number(positionMs) || 0)
+    const now = Date.now()
+    const hold = seekHold.current
+    if (hold) {
+      if (now < hold.until) {
+        // Accept remote once it converges near the seek target.
+        if (Math.abs(remote - hold.target) < 2500) {
+          seekHold.current = null
+          base.current = { pos: remote, at: now, playing }
+        }
+        return
+      }
+      seekHold.current = null
     }
-  }, [positionMs, status, dragging])
+    const predicted = base.current.playing
+      ? base.current.pos + (now - base.current.at)
+      : base.current.pos
+    // Phone seek / restart / big AVRCP jump — snap hard.
+    if (Math.abs(remote - predicted) > 1200) {
+      base.current = { pos: remote, at: now, playing }
+      return
+    }
+    base.current = { pos: remote, at: now, playing }
+  }, [positionMs, status, dragging, playing])
 
   useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 250)
+    const id = setInterval(() => setTick((t) => t + 1), 200)
     return () => clearInterval(id)
   }, [])
 
@@ -440,6 +550,12 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
   let shown = dragging ? draft : base.current.pos
   if (!dragging && base.current.playing && durationMs > 0) {
     shown = Math.min(durationMs, base.current.pos + (Date.now() - base.current.at))
+  }
+  // During seek hold, keep interpolating from optimistic target.
+  if (!dragging && seekHold.current && Date.now() < seekHold.current.until) {
+    const hold = seekHold.current
+    shown = hold.target + (playing ? Date.now() - hold.at : 0)
+    if (durationMs > 0) shown = Math.min(durationMs, Math.max(0, shown))
   }
   const pct = durationMs > 0 ? Math.min(100, (shown / durationMs) * 100) : 0
 
@@ -449,6 +565,14 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
     const rect = el.getBoundingClientRect()
     const x = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
     return Math.round(x * durationMs)
+  }
+
+  function commitSeek(next) {
+    const now = Date.now()
+    seekHold.current = { target: next, until: now + 4500, at: now }
+    base.current = { pos: next, at: now, playing: true }
+    setDraft(next)
+    onSeek?.(next)
   }
 
   function onPointerDown(ev) {
@@ -468,8 +592,7 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
     if (!dragging) return
     const next = posFromClientX(ev.clientX)
     setDragging(false)
-    setDraft(next)
-    onSeek?.(next)
+    commitSeek(next)
   }
 
   return (
@@ -492,10 +615,10 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
           const step = Math.max(1000, Math.round(durationMs * 0.05))
           if (ev.key === 'ArrowRight' || ev.key === 'ArrowUp') {
             ev.preventDefault()
-            onSeek?.(Math.min(durationMs, shown + step))
+            commitSeek(Math.min(durationMs, Math.round(shown + step)))
           } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowDown') {
             ev.preventDefault()
-            onSeek?.(Math.max(0, shown - step))
+            commitSeek(Math.max(0, Math.round(shown - step)))
           }
         }}
       >
@@ -509,8 +632,8 @@ function TrackProgress({ positionMs, durationMs, status, onSeek }) {
         />
       </div>
       <div className="mt-1.5 flex justify-between font-sans text-[0.7rem] tabular-nums text-spot-mute">
-        <span>{formatMs(shown)}</span>
-        <span>{durationMs > 0 ? formatMs(durationMs) : '—:—'}</span>
+        <span>{durationMs > 0 || shown > 0 ? formatMs(shown) : '—'}</span>
+        <span>{durationMs > 0 ? formatMs(durationMs) : '—'}</span>
       </div>
     </div>
   )
@@ -524,8 +647,9 @@ export default function App() {
   const [listening, setListening] = useState(false)
   const fileRef = useRef(null)
   const audioCtxRef = useRef(null)
+  const audioFlushRef = useRef(null)
 
-  useListenThrough(listening, audioCtxRef)
+  useListenThrough(listening, audioCtxRef, audioFlushRef)
 
   function toggleListen() {
     const next = !listening
@@ -585,17 +709,15 @@ export default function App() {
   const title = (np.title || '').trim()
   const artist = (np.artist || '').trim()
   const album = (np.album || '').trim()
+  const playerName = (np.player_name || '').trim()
   const playStatus = (np.status || '').toLowerCase()
-  const hasTrack = Boolean(title || artist)
   const positionMs = Number(np.position_ms) || 0
   const durationMs = Number(np.duration_ms) || 0
+  const coverUrl = useCoverArt(title, artist, album)
 
-  const displayTitle = title || (audioMode === 'bluetooth' ? 'Not playing' : 'Live mic')
-  const displayArtist = artist
-    || (audioMode === 'bluetooth'
-      ? (live ? 'Connect iPhone · Synco Detector' : 'Connecting…')
-      : (state?.mic_name || 'Microphone'))
-  const displayAlbum = album || (audioMode === 'bluetooth' ? 'Bluetooth audio sink' : 'Local capture')
+  const displayTitle = title || '—'
+  const displayArtist = artist || '—'
+  const displayAlbum = album || (playerName || '—')
 
   const specNow = Number.isFinite(v.spectrum) ? v.spectrum : 50
   const specAvg = Number.isFinite(v.spectrum_avg) ? v.spectrum_avg : specNow
@@ -616,19 +738,45 @@ export default function App() {
           ? 'Paused'
           : mapActive
             ? 'Listening'
-            : audioMode === 'bluetooth'
-              ? 'Waiting for audio'
-              : 'Listening')
+            : '—')
 
   async function btControl(action, position_ms) {
+    if (action === 'seek' || action === 'next' || action === 'prev') {
+      try {
+        audioFlushRef.current?.()
+      } catch (err) {
+        /* ignore */
+      }
+    }
+    if (action === 'seek' && position_ms != null) {
+      setState((prev) => {
+        if (!prev) return prev
+        const np = { ...(prev.bt_now_playing || {}), position_ms: Math.max(0, Number(position_ms) || 0) }
+        if (!np.status) np.status = 'playing'
+        return { ...prev, bt_now_playing: np }
+      })
+    }
     const body = { action }
     if (position_ms != null) body.position_ms = position_ms
     try {
-      await fetch('/api/bt/control', {
+      const res = await fetch('/api/bt/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       })
+      const data = await res.json().catch(() => null)
+      if (data && data.ok && action === 'seek' && data.position_ms != null) {
+        setState((prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            bt_now_playing: {
+              ...(prev.bt_now_playing || {}),
+              position_ms: Math.max(0, Number(data.position_ms) || 0)
+            }
+          }
+        })
+      }
     } catch (err) {
       console.warn(err)
     }
@@ -734,15 +882,18 @@ export default function App() {
         <div className="flex flex-col gap-6 sm:flex-row sm:items-end">
           <div className="w-full max-w-[240px] shrink-0 sm:w-56">
             <div
-              className="aspect-square w-full rounded-md shadow-art"
-              style={coverStyle(displayTitle, displayArtist)}
+              className="relative aspect-square w-full overflow-hidden rounded-md shadow-art"
+              style={coverUrl ? { background: '#111' } : coverStyle(title, artist)}
               aria-hidden
             >
-              <div className="flex h-full w-full items-end p-4">
-                <div className="font-display text-4xl font-bold text-white/90 drop-shadow">
-                  {(title || 'S').slice(0, 1).toUpperCase()}
-                </div>
-              </div>
+              {coverUrl ? (
+                <img
+                  src={coverUrl}
+                  alt=""
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                />
+              ) : null}
             </div>
             <TrackProgress
               positionMs={positionMs}
@@ -780,7 +931,7 @@ export default function App() {
           </div>
           <div className="min-w-0 flex-1 pb-1">
             <div className="font-sans text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-spot-mute">
-              {hasTrack ? 'Now playing' : audioMode === 'bluetooth' ? 'Ready for Bluetooth' : 'Live input'}
+              Now playing
             </div>
             <h2 className="mt-2 truncate font-display text-3xl font-bold tracking-tight text-white sm:text-4xl">
               {displayTitle}

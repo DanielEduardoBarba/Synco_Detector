@@ -374,7 +374,48 @@ class Engine:
     def media_command(self, action: str, position_ms: int | None = None) -> dict:
         if not self.audio_sink or not hasattr(self.capture, "media_command"):
             return {"ok": False, "error": "Bluetooth sink mode required"}
-        return self.capture.media_command(action, position_ms=position_ms)
+        result = self.capture.media_command(action, position_ms=position_ms)
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result if isinstance(result, dict) else {"ok": False, "error": "media command failed"}
+        # Prefer phone-confirmed position when the helper returns one.
+        confirmed = result.get("position_ms")
+        if action == "seek":
+            try:
+                position_ms = int(confirmed if confirmed is not None else position_ms)
+            except (TypeError, ValueError):
+                pass
+        # Optimistic UI + flush so scrubber/audio don't sit on stale buffer.
+        with self._meta_lock:
+            np_meta = dict(self.state.bt_now_playing) if isinstance(self.state.bt_now_playing, dict) else {}
+            if action == "seek" and position_ms is not None:
+                try:
+                    pos = max(0, int(position_ms))
+                except (TypeError, ValueError):
+                    pos = 0
+                np_meta["position_ms"] = pos
+                self._last_pos_ms = pos
+                if not np_meta.get("status"):
+                    np_meta["status"] = "playing"
+            elif action == "pause":
+                np_meta["status"] = "paused"
+            elif action == "play":
+                np_meta["status"] = "playing"
+            elif action in {"next", "prev"}:
+                np_meta["position_ms"] = 0
+                self._last_pos_ms = 0
+            try:
+                live = getattr(self.capture, "now_playing", None)
+                live = live() if callable(live) else live
+                if isinstance(live, dict):
+                    np_meta = {**np_meta, **live}
+                    if action == "seek" and position_ms is not None:
+                        np_meta["position_ms"] = max(0, int(position_ms))
+            except Exception:
+                pass
+            self.state.bt_now_playing = np_meta
+            self.state.updated_at = time.time()
+        self._broadcast()
+        return result
 
     def _reset_for_new_song(self, artist: str, title: str, reason: str) -> None:
         self.reset_song_average()
@@ -413,6 +454,7 @@ class Engine:
             return
         title = str(meta.get("title") or "").strip()
         artist = str(meta.get("artist") or "").strip()
+        album = str(meta.get("album") or "").strip()
         try:
             pos = max(0, int(meta.get("position_ms") or 0))
         except (TypeError, ValueError):
@@ -424,10 +466,30 @@ class Engine:
 
         reason: str | None = None
         with self._meta_lock:
-            # Always refresh player chrome (position / duration / status).
-            self.state.bt_now_playing = meta
+            prev = self.state.bt_now_playing if isinstance(self.state.bt_now_playing, dict) else {}
+            # Sticky merge: never flash empty title over a known track mid-skip.
             if not title and not artist:
-                return
+                title = str(prev.get("title") or "").strip()
+                artist = str(prev.get("artist") or "").strip()
+                album = album or str(prev.get("album") or "").strip()
+                if not dur:
+                    try:
+                        dur = max(0, int(prev.get("duration_ms") or 0))
+                    except (TypeError, ValueError):
+                        dur = 0
+                merged = {**prev, **meta, "title": title, "artist": artist, "album": album}
+                if dur:
+                    merged["duration_ms"] = dur
+                self.state.bt_now_playing = merged
+                if not title and not artist:
+                    return
+            else:
+                if not album:
+                    album = str(prev.get("album") or "").strip()
+                merged = {**prev, **meta, "title": title, "artist": artist, "album": album}
+                if dur:
+                    merged["duration_ms"] = dur
+                self.state.bt_now_playing = merged
 
             sig = f"{artist.casefold()}|{title.casefold()}"
             if sig == self._track_sig:
@@ -449,10 +511,10 @@ class Engine:
                 if restarted:
                     reason = "repeat"
             else:
-                prev = self._track_sig
+                prev_sig = self._track_sig
                 self._track_sig = sig
                 self._last_pos_ms = pos
-                reason = "track change" if prev else "now playing"
+                reason = "track change" if prev_sig else "now playing"
 
         # Release meta lock before reset (lyrics lock / state lock can block).
         if reason:

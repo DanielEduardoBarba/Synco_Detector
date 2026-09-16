@@ -49,6 +49,14 @@ def _run(cmd: list[str], timeout: float = 8.0) -> tuple[int, str, str]:
         return 124, "", "timeout"
 
 
+def _system_python() -> str:
+    """Prefer system Python for BlueZ helpers (venv often lacks dbus-python)."""
+    for candidate in ("/usr/bin/python3", "/bin/python3"):
+        if Path(candidate).is_file():
+            return candidate
+    return shutil.which("python3") or "python3"
+
+
 def list_bluez_sinks() -> list[str]:
     """Legacy: sinks named bluez_output.* (PC → BT speaker). Rare for phone→PC."""
     code, out, _err = _run(["pactl", "list", "short", "sinks"])
@@ -192,19 +200,23 @@ class BluetoothSinkManager:
         if not _METADATA_SCRIPT.is_file():
             return
         now = time.time()
-        # Keep Position fresh for the UI scrubber (~1 Hz).
-        if now - self._last_meta_poll < 0.85:
+        # Keep Position fresh for the UI scrubber (~3 Hz while playing).
+        playing = str(self.now_playing.get("status") or "").lower() == "playing"
+        min_gap = 0.32 if playing else 0.7
+        if now - self._last_meta_poll < min_gap:
             return
         self._last_meta_poll = now
-        py = shutil.which("python3") or "/usr/bin/python3"
-        code, out, _err = _run([py, str(_METADATA_SCRIPT), "meta"], timeout=4.0)
+        py = _system_python()
+        code, out, err = _run([py, str(_METADATA_SCRIPT), "meta"], timeout=4.0)
         if code != 0 or not out.strip():
+            if err.strip() and "dbus" in err.lower():
+                log.warn(f"bt metadata: {err.strip()[:160]}")
             return
         try:
             meta = json.loads(out)
         except json.JSONDecodeError:
             return
-        if not isinstance(meta, dict):
+        if not isinstance(meta, dict) or meta.get("error"):
             return
         try:
             position_ms = max(0, int(meta.get("position_ms") or 0))
@@ -214,14 +226,34 @@ class BluetoothSinkManager:
             duration_ms = max(0, int(meta.get("duration_ms") or 0))
         except (TypeError, ValueError):
             duration_ms = 0
+        title = str(meta.get("title") or "").strip()
+        artist = str(meta.get("artist") or "").strip()
+        album = str(meta.get("album") or "").strip()
+        genre = str(meta.get("genre") or "").strip()
+        status = str(meta.get("status") or "").strip()
+        prev = self.now_playing if isinstance(self.now_playing, dict) else {}
+        # AVRCP often flashes empty Track on skip — keep last title/artist/album.
+        if not title and not artist:
+            title = str(prev.get("title") or "")
+            artist = str(prev.get("artist") or "")
+            album = album or str(prev.get("album") or "")
+            genre = genre or str(prev.get("genre") or "")
+            if not duration_ms:
+                try:
+                    duration_ms = max(0, int(prev.get("duration_ms") or 0))
+                except (TypeError, ValueError):
+                    duration_ms = 0
+        elif not album:
+            album = str(prev.get("album") or "")
         self.now_playing = {
-            "available": bool(meta.get("available")),
-            "title": str(meta.get("title") or ""),
-            "artist": str(meta.get("artist") or ""),
-            "album": str(meta.get("album") or ""),
-            "genre": str(meta.get("genre") or ""),
-            "status": str(meta.get("status") or ""),
-            "device": str(meta.get("device") or ""),
+            "available": bool(title or artist or album or meta.get("available")),
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "genre": genre,
+            "status": status or str(prev.get("status") or ""),
+            "device": str(meta.get("device") or prev.get("device") or ""),
+            "player_name": str(meta.get("player_name") or prev.get("player_name") or ""),
             "position_ms": position_ms,
             "duration_ms": duration_ms,
             "player_path": str(meta.get("player_path") or ""),
@@ -235,9 +267,6 @@ class BluetoothSinkManager:
         )
         if sig and sig != self._last_meta_sig:
             self._last_meta_sig = sig
-            title = self.now_playing["title"]
-            artist = self.now_playing["artist"]
-            album = self.now_playing["album"]
             if title or artist:
                 bits = [b for b in (artist, title) if b]
                 extra = f" · {album}" if album else ""
@@ -250,7 +279,7 @@ class BluetoothSinkManager:
         """AVRCP transport / seek via BlueZ helper script."""
         if not _METADATA_SCRIPT.is_file():
             return {"ok": False, "error": "metadata helper missing"}
-        py = shutil.which("python3") or "/usr/bin/python3"
+        py = _system_python()
         if action == "seek":
             if position_ms is None:
                 return {"ok": False, "error": "position_ms required"}
@@ -263,9 +292,24 @@ class BluetoothSinkManager:
         if not out.strip():
             return {"ok": False, "error": err.strip() or f"exit {code}"}
         try:
-            return json.loads(out)
+            result = json.loads(out)
         except json.JSONDecodeError:
             return {"ok": False, "error": out.strip() or err.strip() or "bad json"}
+        if action in {"seek", "next", "prev"} and result.get("ok"):
+            self._last_meta_poll = 0.0
+            if action == "seek" and position_ms is not None:
+                try:
+                    pos = max(0, int(position_ms))
+                except (TypeError, ValueError):
+                    pos = 0
+                prev = dict(self.now_playing) if isinstance(self.now_playing, dict) else {}
+                prev["position_ms"] = pos
+                if not prev.get("status"):
+                    prev["status"] = "playing"
+                self.now_playing = prev
+            else:
+                self._poll_now_playing()
+        return result
 
     def _connected_phone_mac(self) -> str | None:
         code, out, _ = _run(["bluetoothctl", "devices", "Connected"], timeout=4.0)
@@ -349,7 +393,7 @@ class BluetoothSinkManager:
         """System-python BlueZ agent that can display/confirm iPhone passkeys."""
         if not _AGENT_SCRIPT.is_file():
             return False
-        py = shutil.which("python3") or "/usr/bin/python3"
+        py = _system_python()
         # Only one DefaultAgent — drop stale Synco agents from prior runs.
         try:
             subprocess.run(
@@ -789,17 +833,18 @@ class BluetoothSinkManager:
     def _watch_loop(self) -> None:
         last_connected = False
         ticks = 0
-        while not self._stop.wait(0.75):
+        while not self._stop.wait(0.35):
             ticks += 1
-            if ticks % 20 == 0 and not last_connected:
+            if ticks % 40 == 0 and not last_connected:
                 _run(["bluetoothctl", "discoverable", "on"], timeout=3.0)
                 _run(["bluetoothctl", "pairable", "on"], timeout=3.0)
 
             streams = self.route_phone_to_silent_sink()
             connected = bool(streams)
             self._phone_connected = connected
+            # Always poll AVRCP — metadata often exists before/without a Pulse stream id.
+            self._poll_now_playing()
             if connected:
-                self._poll_now_playing()
                 self._check_audio_health()
                 # Keep speakers as default even if a reconnect flipped us back to silent.
                 if ticks % 2 == 0:
@@ -833,7 +878,7 @@ class BluetoothSinkManager:
                             self._on_sink(None)
                         except Exception as exc:
                             log.warn(f"bt sink callback: {exc}")
-            elif connected and ticks % 20 == 0:
+            elif connected and ticks % 40 == 0:
                 # Only remind when we have no now-playing and no PCM.
                 if not self.now_playing.get("title") and not self.audio_alive:
                     log.change(
@@ -894,7 +939,10 @@ class BluetoothSinkCapture:
         return dict(self._mgr.now_playing)
 
     def media_command(self, action: str, position_ms: int | None = None) -> dict[str, Any]:
-        return self._mgr.media_command(action, position_ms=position_ms)
+        result = self._mgr.media_command(action, position_ms=position_ms)
+        if action in {"seek", "next", "prev"} and isinstance(result, dict) and result.get("ok"):
+            self.flush_listen()
+        return result
 
     def start(self) -> None:
         if not self._mgr.enable_speaker_mode():
@@ -1078,10 +1126,15 @@ class BluetoothSinkCapture:
     def consume_listen(self, max_seconds: float = 0.12) -> np.ndarray:
         """Return new dry PCM since last consume (no overlaps — for browser playback)."""
         max_n = max(1, min(int(self.sr * max_seconds), self.maxlen))
+        # Stay near the live edge — deep backlog is what makes hear-through feel late.
+        max_lag = max(max_n, int(self.sr * 0.28))
         with self._lock:
             available = int(self._listen_write - self._listen_read)
             if available <= 0:
                 return np.zeros(0, dtype=np.float32)
+            if available > max_lag:
+                self._listen_read = self._listen_write - max_lag
+                available = max_lag
             n = min(available, max_n)
             start = int(self._listen_read % self.maxlen)
             if start + n <= self.maxlen:
@@ -1100,3 +1153,8 @@ class BluetoothSinkCapture:
         if ana_peak > dry_peak * 1.5 and ana_peak >= 0.03:
             return ana
         return dry
+
+    def flush_listen(self) -> None:
+        """Drop queued hear-through PCM so playback resyncs after seek/skip."""
+        with self._lock:
+            self._listen_read = int(self._listen_write)

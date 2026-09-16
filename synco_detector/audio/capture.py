@@ -112,10 +112,14 @@ class MicCapture:
 
     def consume_listen(self, max_seconds: float = 0.12) -> np.ndarray:
         max_n = max(1, min(int(self.sr * max_seconds), self.maxlen))
+        max_lag = max(max_n, int(self.sr * 0.28))
         with self._lock:
             available = int(self._listen_write - self._listen_read)
             if available <= 0:
                 return np.zeros(0, dtype=np.float32)
+            if available > max_lag:
+                self._listen_read = self._listen_write - max_lag
+                available = max_lag
             n = min(available, max_n)
             start = int(self._listen_read % self.maxlen)
             if start + n <= self.maxlen:
@@ -125,3 +129,7 @@ class MicCapture:
                 out = np.concatenate([self._buf[start:], self._buf[: n - k]])
             self._listen_read += n
             return out
+
+    def flush_listen(self) -> None:
+        with self._lock:
+            self._listen_read = int(self._listen_write)
