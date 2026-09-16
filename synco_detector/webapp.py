@@ -106,6 +106,23 @@ async def api_bt_control(payload: dict = Body(default_factory=dict)) -> JSONResp
     return JSONResponse(result)
 
 
+@app.post("/api/audio/ensure-speakers")
+async def api_ensure_speakers() -> JSONResponse:
+    """Make sure desktop/browser audio is on real speakers (not the silent BT sink)."""
+    cap = ENGINE.capture
+    mgr = getattr(cap, "_mgr", None)
+    if mgr is not None and hasattr(mgr, "_ensure_desktop_speakers"):
+        await asyncio.to_thread(mgr._ensure_desktop_speakers)
+        return JSONResponse({"ok": True})
+    return JSONResponse({"ok": False, "error": "not in bluetooth sink mode"})
+
+
+@app.post("/api/history/clear")
+async def api_history_clear() -> JSONResponse:
+    ENGINE.clear_history()
+    return JSONResponse({"ok": True})
+
+
 @app.websocket("/ws")
 async def ws(sock: WebSocket) -> None:
     await sock.accept()
@@ -143,17 +160,27 @@ async def ws_audio(sock: WebSocket) -> None:
     """Stream live float32 mono PCM for in-browser listen-through."""
     await sock.accept()
     log.boot("audio websocket connected")
+    chunk_s = 0.06
     await sock.send_text(
-        json.dumps({"sr": SAMPLE_RATE, "channels": 1, "format": "f32le", "chunk_s": 0.08})
+        json.dumps(
+            {
+                "sr": SAMPLE_RATE,
+                "channels": 1,
+                "format": "f32le",
+                "chunk_s": chunk_s,
+                "mode": "consume",
+            }
+        )
     )
     try:
         while True:
-            y = await asyncio.to_thread(ENGINE.pcm_chunk, 0.08)
+            y = await asyncio.to_thread(ENGINE.pcm_chunk, chunk_s)
             if y.size == 0:
-                await asyncio.sleep(0.06)
+                await asyncio.sleep(0.02)
                 continue
             await sock.send_bytes(np.ascontiguousarray(y, dtype=np.float32).tobytes())
-            await asyncio.sleep(0.055)
+            # Pace roughly with real-time so the client queue stays short.
+            await asyncio.sleep(max(0.008, (y.size / float(SAMPLE_RATE)) * 0.85))
     except WebSocketDisconnect:
         log.boot("audio websocket disconnected")
         return

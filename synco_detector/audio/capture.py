@@ -16,6 +16,8 @@ class MicCapture:
         self._buf = np.zeros(self.maxlen, dtype=np.float32)
         self._write = 0
         self._filled = 0
+        self._listen_read = 0
+        self._listen_write = 0
         self._lock = threading.Lock()
         self._stream = None
         self._err: str | None = None
@@ -59,6 +61,10 @@ class MicCapture:
                     self._buf[: n - k] = mono[k:]
                 self._write = end % self.maxlen
                 self._filled = min(self.maxlen, self._filled + n)
+                self._listen_write += n
+                behind = self._listen_write - self._listen_read
+                if behind > self.maxlen:
+                    self._listen_read = self._listen_write - self.maxlen
 
         try:
             self._stream = sd.InputStream(
@@ -103,3 +109,19 @@ class MicCapture:
                 return self._buf[start : start + n].copy()
             k = self.maxlen - start
             return np.concatenate([self._buf[start:], self._buf[: n - k]])
+
+    def consume_listen(self, max_seconds: float = 0.12) -> np.ndarray:
+        max_n = max(1, min(int(self.sr * max_seconds), self.maxlen))
+        with self._lock:
+            available = int(self._listen_write - self._listen_read)
+            if available <= 0:
+                return np.zeros(0, dtype=np.float32)
+            n = min(available, max_n)
+            start = int(self._listen_read % self.maxlen)
+            if start + n <= self.maxlen:
+                out = self._buf[start : start + n].copy()
+            else:
+                k = self.maxlen - start
+                out = np.concatenate([self._buf[start:], self._buf[: n - k]])
+            self._listen_read += n
+            return out

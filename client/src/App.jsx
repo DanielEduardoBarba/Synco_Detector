@@ -156,11 +156,8 @@ function useListenThrough(enabled, ctxRef) {
     const ensureCtx = async () => {
       let ctx = ctxRef?.current
       if (!ctx || ctx.state === 'closed') {
-        try {
-          ctx = new AudioContext({ sampleRate: sr })
-        } catch (err) {
-          ctx = new AudioContext()
-        }
+        // Prefer native rate; we resample stream buffers to match.
+        ctx = new AudioContext()
         if (ctxRef) ctxRef.current = ctx
       }
       if (ctx.state === 'suspended') {
@@ -172,8 +169,7 @@ function useListenThrough(enabled, ctxRef) {
       }
       if (!gainNode || gainNode.context !== ctx) {
         gainNode = ctx.createGain()
-        // A2DP capture is often quiet after analysis AGC — boost for listen-through.
-        gainNode.gain.value = 2.8
+        gainNode.gain.value = 1.85
         gainNode.connect(ctx.destination)
       }
       return ctx
@@ -192,23 +188,21 @@ function useListenThrough(enabled, ctxRef) {
             console.warn(err)
           }
           const ctx = await ensureCtx()
-          nextTime = ctx.currentTime + 0.08
+          nextTime = ctx.currentTime + 0.06
           return
         }
         const ctx = await ensureCtx()
         if (!gainNode) return
         const f32 = new Float32Array(ev.data)
         if (!f32.length) return
-        // Soft peak normalize so quiet BT captures are audible.
         let peak = 0
         for (let i = 0; i < f32.length; i += 1) {
           const a = Math.abs(f32[i])
           if (a > peak) peak = a
         }
-        if (peak > 1e-5 && peak < 0.22) {
-          const boost = Math.min(6, 0.35 / peak)
-          for (let i = 0; i < f32.length; i += 1) f32[i] *= boost
-        }
+        // Skip pure digital silence (A2DP idle) so we don't schedule dead air.
+        if (peak < 1e-5) return
+        // Always tag the buffer with the stream sample rate; the context resamples.
         const buf = ctx.createBuffer(1, f32.length, sr)
         buf.copyToChannel(f32, 0)
         const src = ctx.createBufferSource()
@@ -216,11 +210,19 @@ function useListenThrough(enabled, ctxRef) {
         src.connect(gainNode)
         const now = ctx.currentTime
         if (nextTime < now + 0.04) nextTime = now + 0.04
+        if (nextTime > now + 0.4) nextTime = now + 0.06
         src.start(nextTime)
         nextTime += buf.duration
       }
       ws.onclose = () => {
         if (!closed) setTimeout(connect, 900)
+      }
+      ws.onerror = () => {
+        try {
+          ws.close()
+        } catch (err) {
+          /* ignore */
+        }
       }
     }
 
@@ -241,6 +243,82 @@ function useListenThrough(enabled, ctxRef) {
       }
     }
   }, [enabled, ctxRef])
+}
+
+function MiniGroove({ avg }) {
+  const v = Math.max(0, Math.min(100, Number(avg) || 50))
+  const syncHeavy = v >= 55
+  return (
+    <div className="relative h-1.5 w-full max-w-[9.5rem] rounded-full bg-gradient-to-r from-[#1ed760] via-[#8a8a8a] to-[#e91429]">
+      <div
+        className={`absolute -top-1 h-3.5 w-1.5 -translate-x-1/2 rounded-sm shadow-[0_0_0_1px_#0008] ${
+          syncHeavy ? 'bg-[#e91429]' : 'bg-[#1ed760]'
+        }`}
+        style={{ left: `${v}%` }}
+        title={`avg ${v.toFixed(0)}`}
+      />
+    </div>
+  )
+}
+
+function SongHistory({ rows, onClear }) {
+  const list = Array.isArray(rows) ? rows : []
+  return (
+    <section className="rounded-2xl bg-spot-raised/90 px-4 py-4 sm:px-5 sm:py-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div className="font-sans text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-spot-mute">
+            History
+          </div>
+          <p className="mt-1 font-sans text-sm text-white/70">
+            Songs + groove average · replays overwrite
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onClear}
+          disabled={list.length === 0}
+          className="rounded-full border border-white/15 px-3 py-1 font-sans text-xs text-white/70 transition hover:border-white/35 hover:text-white disabled:opacity-35"
+        >
+          Clear
+        </button>
+      </div>
+      {list.length === 0 ? (
+        <p className="font-sans text-sm text-spot-mute">No songs yet — play something on the phone.</p>
+      ) : (
+        <ul className="divide-y divide-white/5">
+          {list.map((row) => {
+            const avg = Number(row.spectrum_avg)
+            const syncHeavy = avg >= 55
+            return (
+              <li key={row.key || `${row.artist}|${row.title}`} className="flex items-center gap-3 py-3">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-display text-sm font-semibold text-white">
+                    {row.title || 'Unknown'}
+                  </div>
+                  <div className="mt-0.5 truncate font-sans text-xs text-spot-mute">
+                    {row.artist || '—'}
+                    {row.album ? ` · ${row.album}` : ''}
+                    {row.plays > 1 ? ` · ×${row.plays}` : ''}
+                  </div>
+                </div>
+                <div className="flex w-[10.5rem] shrink-0 flex-col items-end gap-1.5">
+                  <div
+                    className={`font-sans text-[0.65rem] capitalize ${
+                      syncHeavy ? 'text-rose-300' : 'text-emerald-300'
+                    }`}
+                  >
+                    {row.side || '—'} · {Number.isFinite(avg) ? Math.round(avg) : '—'}
+                  </div>
+                  <MiniGroove avg={avg} />
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
 }
 
 function AudioMap({ values, active }) {
@@ -460,6 +538,8 @@ export default function App() {
       } catch (err) {
         console.warn(err)
       }
+      // Pull browser playback off the silent analysis sink if it got parked there.
+      fetch('/api/audio/ensure-speakers', { method: 'POST' }).catch(() => {})
     } else {
       try {
         audioCtxRef.current?.suspend()
@@ -586,6 +666,15 @@ export default function App() {
       setReport(String(err))
     } finally {
       setTesting(false)
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await fetch('/api/history/clear', { method: 'POST' })
+      setState((prev) => (prev ? { ...prev, song_history: [] } : prev))
+    } catch (err) {
+      console.warn(err)
     }
   }
 
@@ -725,6 +814,10 @@ export default function App() {
           side={v.side}
           judgment={v.judgment}
         />
+      </div>
+
+      <div className="mb-4 animate-riseIn" style={{ animationDelay: '140ms' }}>
+        <SongHistory rows={state?.song_history || []} onClear={clearHistory} />
       </div>
 
       <section

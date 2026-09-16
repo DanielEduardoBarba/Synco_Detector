@@ -68,6 +68,7 @@ class LiveState:
     freq_map: list[float] = field(default_factory=list)
     lyrics: LyricsState = field(default_factory=LyricsState)
     verdict: dict = field(default_factory=dict)
+    song_history: list = field(default_factory=list)
     updated_at: float = 0.0
 
     def to_dict(self) -> dict:
@@ -95,6 +96,7 @@ class LiveState:
                 "segments": self.lyrics.segments[-6:],
             },
             "verdict": self.verdict,
+            "song_history": list(self.song_history),
             "updated_at": self.updated_at,
         }
 
@@ -125,6 +127,8 @@ class Engine:
         self._bt_wait_announced = False
         self._track_sig = ""
         self._last_pos_ms: int | None = None
+        self._history: dict[str, dict] = {}
+        self._history_order: list[str] = []
 
     def subscribe(self, fn: Callable[[dict], None]) -> Callable[[], None]:
         self._listeners.append(fn)
@@ -280,14 +284,92 @@ class Engine:
         self._ema = None
 
     def pcm_chunk(self, seconds: float = 0.08) -> np.ndarray:
-        """Latest float32 mono PCM for browser listen-through."""
+        """New dry float32 mono PCM for browser listen-through (no overlapping slices)."""
         try:
-            y = self.capture.latest(seconds)
+            if hasattr(self.capture, "consume_listen"):
+                y = self.capture.consume_listen(seconds)
+            else:
+                y = self.capture.latest(seconds)
         except Exception:
             return np.zeros(0, dtype=np.float32)
         if y is None or getattr(y, "size", 0) == 0:
             return np.zeros(0, dtype=np.float32)
         return np.asarray(y, dtype=np.float32)
+
+    def clear_history(self) -> None:
+        with self._lock:
+            self._history.clear()
+            self._history_order.clear()
+            self.state.song_history = []
+            self.state.updated_at = time.time()
+        self._broadcast()
+
+    def _publish_history(self) -> None:
+        rows = [self._history[k] for k in self._history_order if k in self._history]
+        self.state.song_history = rows
+
+    def _upsert_history(
+        self,
+        *,
+        artist: str,
+        title: str,
+        album: str = "",
+        duration_ms: int = 0,
+        spectrum_avg: float | None = None,
+        side: str = "",
+        judgment: str = "",
+        confidence: float | None = None,
+        reset: bool = False,
+    ) -> None:
+        if not title and not artist:
+            return
+        key = f"{artist.casefold()}|{title.casefold()}"
+        now = time.time()
+        with self._lock:
+            prev = self._history.get(key)
+            if reset or prev is None:
+                plays = 1 if prev is None else int(prev.get("plays") or 1)
+                if reset and prev is not None:
+                    plays = int(prev.get("plays") or 0) + 1
+                row = {
+                    "key": key,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "duration_ms": int(duration_ms or 0),
+                    "spectrum_avg": 50.0 if spectrum_avg is None else float(spectrum_avg),
+                    "side": side or "—",
+                    "judgment": judgment or "Listening…",
+                    "confidence": float(confidence or 0.0),
+                    "updated_at": now,
+                    "plays": plays,
+                }
+            else:
+                row = dict(prev)
+                row["title"] = title or row.get("title") or ""
+                row["artist"] = artist or row.get("artist") or ""
+                if album:
+                    row["album"] = album
+                if duration_ms:
+                    row["duration_ms"] = int(duration_ms)
+                if spectrum_avg is not None:
+                    row["spectrum_avg"] = float(spectrum_avg)
+                if side:
+                    row["side"] = side
+                if judgment:
+                    row["judgment"] = judgment
+                if confidence is not None:
+                    row["confidence"] = float(confidence)
+                row["updated_at"] = now
+            self._history[key] = row
+            if key in self._history_order:
+                self._history_order.remove(key)
+            self._history_order.insert(0, key)
+            # Cap history length.
+            while len(self._history_order) > 40:
+                old = self._history_order.pop()
+                self._history.pop(old, None)
+            self._publish_history()
 
     def media_command(self, action: str, position_ms: int | None = None) -> dict:
         if not self.audio_sink or not hasattr(self.capture, "media_command"):
@@ -300,6 +382,24 @@ class Engine:
             self.lyrics.reset_for_new_track()
         except Exception:
             pass
+        np_meta = self.state.bt_now_playing if isinstance(self.state.bt_now_playing, dict) else {}
+        album = str(np_meta.get("album") or "").strip()
+        try:
+            duration_ms = int(np_meta.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0
+        # Same song again → overwrite history row and rebuild avg from scratch.
+        self._upsert_history(
+            artist=artist,
+            title=title,
+            album=album,
+            duration_ms=duration_ms,
+            spectrum_avg=50.0,
+            side="—",
+            judgment="Listening…",
+            confidence=0.0,
+            reset=True,
+        )
         with self._lock:
             self.state.verdict = {}
             self.state.lyrics = self.lyrics.state
@@ -352,8 +452,7 @@ class Engine:
                 prev = self._track_sig
                 self._track_sig = sig
                 self._last_pos_ms = pos
-                if prev:
-                    reason = "track change"
+                reason = "track change" if prev else "now playing"
 
         # Release meta lock before reset (lyrics lock / state lock can block).
         if reason:
@@ -462,6 +561,25 @@ class Engine:
                 self.state.signal_level = level
                 self.state.lyrics = self.lyrics.state
                 self.state.updated_at = time.time()
+            np_meta = self.state.bt_now_playing if isinstance(self.state.bt_now_playing, dict) else {}
+            title = str(np_meta.get("title") or "").strip()
+            artist = str(np_meta.get("artist") or "").strip()
+            if title or artist:
+                try:
+                    duration_ms = int(np_meta.get("duration_ms") or 0)
+                except (TypeError, ValueError):
+                    duration_ms = 0
+                self._upsert_history(
+                    artist=artist,
+                    title=title,
+                    album=str(np_meta.get("album") or "").strip(),
+                    duration_ms=duration_ms,
+                    spectrum_avg=float(v.spectrum_avg),
+                    side=str(v.side or ""),
+                    judgment=str(v.judgment or ""),
+                    confidence=float(v.confidence or 0.0),
+                    reset=False,
+                )
             self._broadcast()
 
     def _lyrics_loop(self) -> None:

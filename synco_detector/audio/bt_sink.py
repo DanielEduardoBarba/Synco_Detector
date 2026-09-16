@@ -288,7 +288,8 @@ class BluetoothSinkManager:
             log.change("a2dp-nudge", f"a2dp silent ({reason}) — no connected phone", tag="warn")
             return
         log.bt(f"A2DP audio stuck ({reason}) — soft-reconnecting {mac}")
-        self._prefer_silent_for_new_streams()
+        # Keep desktop speakers as default so browser hear-through stays audible.
+        self._ensure_desktop_speakers()
         _run(["bluetoothctl", "trust", mac], timeout=4.0)
         code, _o, _e = _run(["bluetoothctl", "connect", mac], timeout=12.0)
         if code != 0:
@@ -303,6 +304,13 @@ class BluetoothSinkManager:
                 _run(["pactl", "set-card-profile", parts[1], "audio-gateway"], timeout=5.0)
         time.sleep(0.6)
         self.route_phone_to_silent_sink()
+        self._ensure_desktop_speakers()
+        restart = getattr(self, "_restart_capture_ref", None)
+        if callable(restart):
+            try:
+                restart()
+            except Exception as exc:
+                log.warn(f"capture restart after a2dp nudge: {exc}")
         log.bt("A2DP nudge done — press Play once on iPhone if still silent")
 
     def _check_audio_health(self) -> None:
@@ -525,12 +533,21 @@ class BluetoothSinkManager:
         return scored[0][1]
 
     def _prefer_silent_for_new_streams(self) -> None:
-        """Remember speakers, briefly prefer silent so a fresh A2DP stream lands there."""
+        """Remember speakers. Do not leave default on silent — that mutes the browser.
+
+        Phone A2DP is moved onto the silent sink by route_phone_to_silent_sink().
+        """
         hw = self._pick_hardware_sink()
         if hw:
             self._saved_default_sink = hw
-        _run(["pactl", "set-default-sink", SYNCO_SILENT_SINK], timeout=4.0)
-        log.bt(f"default sink → {SYNCO_SILENT_SINK} (arming for phone; speakers restored after connect)")
+            _c, dout, _ = _run(["pactl", "get-default-sink"])
+            current = dout.strip() if _c == 0 else ""
+            if current != hw:
+                _run(["pactl", "set-default-sink", hw], timeout=4.0)
+                log.bt(f"default sink → {hw} (desktop/browser audible; phone routed separately)")
+        # Ensure silent sink exists for phone parking.
+        if not _sink_exists(SYNCO_SILENT_SINK):
+            self.ensure_silent_sink()
 
     def _restore_default_sink(self) -> None:
         self._ensure_desktop_speakers(force_log=True)
@@ -838,17 +855,22 @@ class BluetoothSinkCapture:
         self.sr = sr
         self.maxlen = int(sr * maxlen_s)
         self._buf = np.zeros(self.maxlen, dtype=np.float32)
+        self._listen = np.zeros(self.maxlen, dtype=np.float32)
         self._write = 0
         self._filled = 0
+        self._listen_read = 0  # absolute sample counter for consume
+        self._listen_write = 0  # absolute sample counter
         self._lock = threading.Lock()
         self._err: str | None = None
         self.device_name = "bluetooth-sink (waiting…)"
         self._level = 0.08
         self.gain = 1.0
+        self._listen_gain = 1.0
         self.mode = "bluetooth"
         alias = alias or os.environ.get("SYNCO_BT_ALIAS", "Synco Detector")
         self._mgr = BluetoothSinkManager(alias=alias)
         self._mgr._live_peak_ref = lambda: float(self.live_peak)
+        self._mgr._restart_capture_ref = self.restart_monitor_capture
         self._parec: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
@@ -898,6 +920,21 @@ class BluetoothSinkCapture:
         except Exception:
             pass
 
+    def restart_monitor_capture(self) -> None:
+        """Bounce parec after A2DP recoveries so the monitor is not stuck silent."""
+        sink = self._current_sink or SYNCO_SILENT_SINK
+        self._stop_parec()
+        self._current_sink = None
+        with self._lock:
+            self._write = 0
+            self._filled = 0
+            self._listen_read = 0
+            self._listen_write = 0
+            self._buf[:] = 0
+            self._listen[:] = 0
+        self._on_sink_change(sink)
+        log.bt(f"capture restarted on {sink}.monitor")
+
     def _on_sink_change(self, sink: str | None) -> None:
         if sink is None:
             # Keep silent-sink capture running; just update label.
@@ -912,16 +949,17 @@ class BluetoothSinkCapture:
         self._start_parec(monitor_for_sink(sink))
 
     def _stop_parec(self) -> None:
-        if self._parec is not None:
+        proc = self._parec
+        self._parec = None
+        if proc is not None:
             try:
-                self._parec.terminate()
-                self._parec.wait(timeout=2.0)
+                proc.terminate()
+                proc.wait(timeout=2.0)
             except Exception:
                 try:
-                    self._parec.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            self._parec = None
         if self._reader and self._reader.is_alive():
             self._reader.join(timeout=1.5)
         self._reader = None
@@ -953,44 +991,66 @@ class BluetoothSinkCapture:
         self._reader.start()
 
     def _read_loop(self) -> None:
-        assert self._parec is not None and self._parec.stdout is not None
+        proc = self._parec
+        if proc is None or proc.stdout is None:
+            return
         chunk = 1024 * 4
-        while not self._stop.is_set() and self._parec.poll() is None:
+        while not self._stop.is_set():
+            if self._parec is not proc:
+                break
+            if proc.poll() is not None:
+                break
             try:
-                data = self._parec.stdout.read(chunk)
+                data = proc.stdout.read(chunk)
             except Exception as exc:
                 self._err = f"parec read: {exc}"
                 break
             if not data:
                 time.sleep(0.02)
                 continue
-            mono = np.frombuffer(data, dtype=np.float32).copy()
-            if mono.size == 0:
+            raw = np.frombuffer(data, dtype=np.float32).copy()
+            if raw.size == 0:
                 continue
-            block_peak = float(np.max(np.abs(mono)))
+            block_peak = float(np.max(np.abs(raw)))
             self._level = 0.97 * self._level + 0.03 * max(block_peak, 1e-4)
             self.live_peak = self._level
+            # Listen path: smooth gain toward a healthy playback level (quiet A2DP
+            # still needs lift; avoid the analysis path's extreme pumping).
+            if block_peak > 1e-5:
+                target = float(np.clip(0.38 / block_peak, 1.0, 14.0))
+            else:
+                target = max(1.0, self._listen_gain * 0.98)
+            self._listen_gain = 0.88 * self._listen_gain + 0.12 * target
+            dry = np.clip(raw * self._listen_gain, -0.95, 0.95)
+            # Analysis path: stronger AGC for rhythm/lyrics stability.
             if self._level > 0.55:
                 self.gain = 0.55 / self._level
             elif self._level > 1e-5:
-                # A2DP on a null sink is often quiet — lift toward analysis-friendly level.
                 self.gain = min(10.0, 0.22 / self._level)
             else:
                 self.gain = 1.0
-            mono = np.clip(mono * self.gain, -0.98, 0.98)
+            mono = np.clip(raw * self.gain, -0.98, 0.98)
             n = mono.size
             with self._lock:
                 i = self._write
                 end = i + n
                 if end <= self.maxlen:
                     self._buf[i:end] = mono
+                    self._listen[i:end] = dry
                 else:
                     k = self.maxlen - i
                     self._buf[i:] = mono[:k]
                     self._buf[: n - k] = mono[k:]
+                    self._listen[i:] = dry[:k]
+                    self._listen[: n - k] = dry[k:]
                 self._write = end % self.maxlen
                 self._filled = min(self.maxlen, self._filled + n)
-        if self._parec is not None and self._parec.poll() not in (None, 0):
+                self._listen_write += n
+                # Drop unread listen samples that were overwritten.
+                behind = self._listen_write - self._listen_read
+                if behind > self.maxlen:
+                    self._listen_read = self._listen_write - self.maxlen
+        if proc.poll() not in (None, 0) and self._parec is proc:
             log.warn("parec exited — phone may have disconnected")
 
     @property
@@ -1014,3 +1074,29 @@ class BluetoothSinkCapture:
                 return self._buf[start : start + n].copy()
             k = self.maxlen - start
             return np.concatenate([self._buf[start:], self._buf[: n - k]])
+
+    def consume_listen(self, max_seconds: float = 0.12) -> np.ndarray:
+        """Return new dry PCM since last consume (no overlaps — for browser playback)."""
+        max_n = max(1, min(int(self.sr * max_seconds), self.maxlen))
+        with self._lock:
+            available = int(self._listen_write - self._listen_read)
+            if available <= 0:
+                return np.zeros(0, dtype=np.float32)
+            n = min(available, max_n)
+            start = int(self._listen_read % self.maxlen)
+            if start + n <= self.maxlen:
+                dry = self._listen[start : start + n].copy()
+                ana = self._buf[start : start + n].copy()
+            else:
+                k = self.maxlen - start
+                dry = np.concatenate([self._listen[start:], self._listen[: n - k]])
+                ana = np.concatenate([self._buf[start:], self._buf[: n - k]])
+            self._listen_read += n
+        dry_peak = float(np.max(np.abs(dry))) if dry.size else 0.0
+        ana_peak = float(np.max(np.abs(ana))) if ana.size else 0.0
+        # Prefer musical dry path; fall back to analysis AGC if dry is still too quiet.
+        if dry_peak >= 0.04:
+            return dry
+        if ana_peak > dry_peak * 1.5 and ana_peak >= 0.03:
+            return ana
+        return dry
